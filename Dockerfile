@@ -23,3 +23,4 @@ RUN tar -xvzf pynaoqi-python2.7-2.5.5.5-linux64.tar.gz -C /root/
 RUN rm pynaoqi-python2.7-2.5.5.5-linux64.tar.gz
 RUN echo "export PYTHONPATH=${PYTHONPATH}:/root/pynaoqi-python2.7-2.5.5.5-linux64/lib/python2.7/site-packages" >> ~/.bashrc
 RUN echo "export DYLD_LIBRARY_PATH=${DYLD_LIBRARY_PATH}:/root/pynaoqi-python2.7-2.5.5.5-linux64/lib" >> ~/.bashrc
+RUN echo "source /opt/ros/kinetic/setup.bash" >> ~/.bashrc
