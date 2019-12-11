@@ -1,9 +1,5 @@
 FROM osrf/ros:kinetic-desktop-full
 
-#LABEL com.nvidia.volumes.needed="nvidia_driver"
-#ENV PATH /usr/local/nvidia/bin:${PATH}
-#ENV LD_LIBRARY_PATH /usr/local/nvidia/lib:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
-
 ENV NVIDIA_VISIBLE_DEVICES ${NVIDIA_VISIBLE_DEVICES:-all}
 ENV NVIDIA_DRIVER_CAPABILITIES ${NVIDIA_DRIVER_CAPABILITIES:+$NVIDIA_DRIVER_CAPABILITIES,}graphics
 
@@ -26,16 +22,6 @@ RUN pip install pygame
 RUN mkdir -p /root/git/
 RUN git clone https://github.com/RyuYamamoto/haze_setting /root/git/haze_setting/
 RUN cp /root/git/haze_setting/tmux/tmux.conf ~/.tmux.conf
-
-# neovim
-RUN apt install software-properties-common
-RUN add-apt-repository ppa:neovim-ppa/unstable
-RUN apt update
-RUN apt install neovim global ctags
-RUN apt install python3-dev python3-pip
-RUN pip3 install -U pip3
-RUN mkdir -p /root/.config/nvim
-RUN cp /root/git/haze_setting/
 
 RUN cd /root/ && \
 	git clone https://github.com/RyuYamamoto/libqi -b new_boost_version && \
