@@ -12,6 +12,10 @@ import numpy as np
 import qi
 import almath
 import argparse
+import math
+import sys
+
+NOISE_THRESHOLD = 0.00001
 
 class Authenticator:
     def __init__(self, user, pswd):
@@ -37,7 +41,6 @@ def interpolation(waypoint_list, alg="linear"):
     for waypoint in waypoint_list:
         temp_x = np.append(temp_x, waypoint[0])
         temp_y = np.append(temp_y, waypoint[1])
-    print temp_x, temp_y
     cubic_spline = None
     if alg == "linear":
         cubic_spline = interp1d(temp_x, temp_y)
@@ -47,18 +50,184 @@ def interpolation(waypoint_list, alg="linear"):
     waypoint_x_start = temp_x[0]
     waypoint_x_end = temp_x[-1]
     length =  (int)(abs(waypoint_x_end - waypoint_x_start)/0.01)
-    print length
     ix = np.linspace(waypoint_x_start, waypoint_x_end , num=length)
     iy = cubic_spline(ix)
 
     return ix, iy
+# ロボットが移動した際の位置の変位を計算し、map座標系に置き換えてオドメトリとして計算する
+class OdometryTracker(object):
+    def __init__(self, session):
+        self.session = session
+        self.motion = self.session.service("ALMotion")
 
+        self.map2odom = almath.Pose2D()
+        self.old_displacement = np.array(self.motion._getCumulatedDisplacement())
+        self.old_position = np.array(self.motion.getRobotPosition(True))
+
+        self.init_position = np.array([0,0,0])
+
+        self._odometry = {"position": almath.Pose2D(), "displacement": almath.Pose2D()}
+
+        self._tracker_task = qi.PeriodicTask()
+        self._tracker_task.setCallback(self._tracker)
+        self._tracker_task.setUsPeriod(200 * 1000)
+        #self._tracker_task.start(True)
+
+    def _tracker(self):
+        position = np.array(self.motion.getRobotPosition(True))
+        displacement = np.array(self.motion._getCumulatedDisplacement())
+
+        dpos = np.sum(position-self.old_position)
+        ddis = np.sum(displacement-self.old_displacement)
+
+        if dpos > NOISE_THRESHOLD or ddis > NOISE_THRESHOLD:
+            world2odom =  almath.Pose2D(self.init_position.tolist()) + almath.Pose2D(dpos.tolist())
+            self._odometry = {"position": almath.Pose2D(position), "displacement": almath.Pose2D(displacement.tolist())}
+
+        self.old_displacement = displacement
+        self.old_position = position
+
+    def _get_odomery(self):
+        return self._odometry
+
+class SteeringControl(object):
+    def __init__(self, session):
+        self.session = session
+        self.move_flag = True
+        self._motion = self.session.service("ALMotion")
+
+        self._max_linear_acc = 1.0
+        self._max_linear_vel = 1.0
+        self._max_angular_vel = 1.0
+        self._max_angular_acc = 2.0
+
+        self._min_linear_vel = 0.05
+        self._min_angular_vel = 0.0
+
+        self._update_parameter()
+
+        self._odometry_tracker = OdometryTracker(session)
+
+        self._prev_linear_vel = 0.0
+        self._prev_angular_vel = 0.0
+
+        self._T = 0.2
+
+        self._goal_translation_tolerance = 0.02
+        self._goal_rotation_tolerance = 0.3
+
+        self.goal = almath.Position2D()
+        self.velocity = {'x':0.0, 'y':0.0}
+
+        self._steering_task = qi.PeriodicTask()
+        self._steering_task.setCallback(self._main_thread)
+        self._steering_task.setUsPeriod(10 * 1000)
+        self._steering_task.start(True)
+
+    def _init_paramter(self):
+        self._prev_linear_vel = 0.0
+        self._prev_angular_vel = 0.0
+
+        self.velocity = {'x':0.0, 'y':0.0}
+
+    def _update_parameter(self):
+        self._f = self._max_linear_acc
+        self._b = self._f / (2.0 * self._max_linear_vel)
+        self._h = (2.0 * self._b * self._max_angular_vel) / self._f
+        self._k_i = self._max_angular_acc / (self._f * self._h)
+
+    def move(self, x, y, theta):
+        if not self.move_flag:
+            self.move_flag = True
+        self.goal.x = x
+        self.goal.y = y
+
+    def _movement_generator(self, F):
+        v=0
+        w=0
+        try:
+            if F.norm() > self._f:
+                angle = math.atan2(F.y, F.x)
+                F.x = math.cos(angle) * self._f
+                F.y = math.sin(angle) * self._f
+
+            v = (F.x * self._T + self._prev_angular_vel) / (1.0 + 2.0 * self._b * self._T)
+            w = (self._k_i * self._h * F.y + self._prev_angular_vel) / (1.0 + 2.0 * self._b * self._k_i * self._T)
+
+            if v < 0:
+                v = 0
+            if math.fabs(w) < 1e-4:
+                w = 0
+        except Exception as error1:
+            self._failure(error1)
+
+        return F, v, w
+
+    def _normalize(self, angle):
+        return angle + (2*almath.PI)*math.floor((almath.PI-angle)/(2*almath.PI))
+
+    def _failure(self, e):
+        exc_type, exc_obj, tb = sys.exc_info()
+        lineno = tb.tb_lineno
+        print(str(lineno)+":"+str(type(e)))
+
+    def _compute_velocity(self, robot_pose):
+        reached = False
+
+        try:
+            robot_pose_xy = almath.Position2D(robot_pose.x, robot_pose.y)
+            distance_goal = self.goal - robot_pose_xy
+
+            if distance_goal.norm() > self._goal_translation_tolerance:
+                angle_goal = self._normalize(math.atan2(distance_goal.y, distance_goal.x) - robot_pose.theta)
+
+                F = almath.Position2D(1.5*math.cos(angle_goal), 1.5*math.sin(angle_goal))
+
+                F, v, w = self._movement_generator(F)
+
+                if math.fabs(angle_goal) > self._goal_translation_tolerance:
+                    #if math.fabs(w) > 0 and math.fabs(angle_goal) > self._goal_rotation_tolerance:
+                    if math.fabs(angle_goal) and math.fabs(w) < self._min_angular_vel:
+                        w = -self._min_angular_vel if w<0 else self._min_angular_vel
+                    self.velocity["y"] = w
+                else:
+                    self.velocity["x"] = v
+                    self.velocity["y"] = w
+            else:
+                reached = True
+        except Exception as error1:
+            self._failure(error1)
+
+        self._prev_linear_vel = self.velocity["x"]
+        self._prev_angular_vel = self.velocity["y"]
+
+        return reached
+
+    def _main_thread(self):
+        if True:
+            odometry = self._odometry_tracker._get_odomery()
+            robot_pose = odometry["position"]
+            if self._compute_velocity(robot_pose):
+                self.move_flag = False
+                self._init_paramter()
+            self._motion.move(self.velocity["x"], self.velocity["y"], 0.0)
+
+# 人検出と簡易的なローカルパス生成
 class LocalPathGenerator(object):
     def __init__(self, ip):
         self.rate = rospy.Rate(100)
         self.connect(ip)
         self.path = rospy.Publisher("/path", Path, queue_size=10)
         self.people_marker = rospy.Publisher("/people_marker", Marker, queue_size=10)
+
+        #self._steering_control = SteeringControl(self.session)
+
+        self.x = self.y = self.theta = 0.0
+
+        self._steering_task = qi.PeriodicTask()
+        self._steering_task.setCallback(self._main_thread)
+        self._steering_task.setUsPeriod(10 * 1000)
+        self._steering_task.start(True)
 
     def connect(self, ip):
         try:
@@ -126,11 +295,16 @@ class LocalPathGenerator(object):
 
         self.people_marker.publish(marker_data)
 
+    # 外れ値フィルタ
+    def _filter(self, data):
+        pass
+
     def _get_human_perception(self):
         human_around = self.perception.humansAroundPrivate.value()
-        self.motion2robot = almath.Pose2D(self.motion.getRobotPosition(True))
+        self.motion2robot = almath.Pose2D(self.motion.getRobotPosition(True))#self._steering_control._odometry_tracker._get_odomery()["position"]
 
         people_list = list()
+        world2people = list()
         for people in human_around:
             human_frame = people.headFrame.value()
             tf = human_frame.computeTransform(self.boot_frame)['transform']
@@ -150,7 +324,8 @@ class LocalPathGenerator(object):
             # robot->world, world->people ==>> robot->people
             people_position = self.motion2robot.inverse() * people_position_tf
             people_list.append(list(people_position.toVector()))
-        return people_list
+            world2people.append(list(people_position_tf.toVector()))
+        return people_list, world2people
 
     def _publish_tf(self, data, frame_id, child_frame_id):
         br = tf2_ros.TransformBroadcaster()
@@ -185,18 +360,55 @@ class LocalPathGenerator(object):
         path.header.stamp = rospy.Time.now()
         self.path.publish(path)
 
+    # 検出した人を追従するための速度の決定
+    def _velocity_control(self, x, y, theta):
+        diff_angle = math.atan2(y, x)
+        if 0.3 < diff_angle:
+            self.x = self.y = 0.0
+            self.theta = 0.5
+        elif diff_angle < -0.3:
+            self.x = self.y = 0.0
+            self.theta = -0.5
+        else:
+            self.theta = 0.0
+            if 0.5 < math.fabs(x):
+                self.x = 0.15
+            elif math.fabs(x) <= 0.5:
+                self.x = -0.15
+            elif 0.5 < math.fbas(x) < 0.6:
+                self.x = 0.0
+            else:
+                self.x = 0.0
+            if 0.2 < y:
+                self.y = 0.1
+            elif y < -0.2:
+                self.y = -0.1
+            else:
+                self.y = 0.0
+
+        print self.x, self.y, self.theta
+
+    def _main_thread(self):
+        try:
+            self.motion.move(self.x, self.y, self.theta)
+        except Exception as e:
+            self._failure(e)
+
     def run(self):
         while not rospy.is_shutdown():
-            people_list = self._get_human_perception()
+            people_list, world2people = self._get_human_perception()
             #self._publish_tf(self._pose2d_to_geometry(list(self.motion2robot.inverse().toVector())), "robot_pose", "robot_pose")
             if people_list != []:
                 self._publish_tf(self._pose2d_to_geometry(people_list[0]), "robot_pose", "people")
                 self._publish_marker(self._pose2d_to_geometry(people_list[0]))
                 self._generate_local_path(people_list)
+                print "people pose:", people_list[0][0], people_list[0][1], people_list[0][2]
+                # ワールド座標系における目標位置を設定する(ここではワールド座標系における一番近い人)
+                #self._steering_control.move(world2people[0][0], world2people[0][1], world2people[0][2])
+                # 速度制御実行
+                #self._steering_control._main_thread()
+                self._velocity_control(people_list[0][0], people_list[0][1], people_list[0][2])
             self.rate.sleep()
-
-    def velocity_control(self):
-        pass
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='test')
