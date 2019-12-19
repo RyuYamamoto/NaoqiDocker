@@ -16,6 +16,7 @@ import math
 import sys
 
 NOISE_THRESHOLD = 0.00001
+MAX_LENGTH      = 5
 
 class Authenticator:
     def __init__(self, user, pswd):
@@ -210,7 +211,7 @@ class SteeringControl(object):
             if self._compute_velocity(robot_pose):
                 self.move_flag = False
                 self._init_paramter()
-            self._motion.move(self.velocity["x"], self.velocity["y"], 0.0)
+            self._motion.move(self.velocity["x"], 0.0, self.velocity["y"])
 
 # 人検出と簡易的なローカルパス生成
 class LocalPathGenerator(object):
@@ -222,12 +223,19 @@ class LocalPathGenerator(object):
 
         #self._steering_control = SteeringControl(self.session)
 
+        self._head_pitch = self._head_yaw = 0.0
+
         self.x = self.y = self.theta = 0.0
+        
+        self.vel_flag = False
+        self.pos_flag = False
 
         self._steering_task = qi.PeriodicTask()
         self._steering_task.setCallback(self._main_thread)
         self._steering_task.setUsPeriod(10 * 1000)
         self._steering_task.start(True)
+
+        self._buffer = list()
 
     def connect(self, ip):
         try:
@@ -249,12 +257,13 @@ class LocalPathGenerator(object):
             rospy.logerr("Error when creating proxy:")
             rospy.logerr(str(error2))
     
-    def _pose2d_to_geometry(self, pose2d):
+    def _pose2d_to_geometry(self, pose6d):
+        pose6d = almath.Position6D(pose6d)
         pose = Pose()
-        pose.position.x = pose2d[0]
-        pose.position.y = pose2d[1]
-        pose.position.z = 0.0
-        q = tf_conversions.transformations.quaternion_from_euler(0.0, 0.0, pose2d[2])
+        pose.position.x = pose6d.x
+        pose.position.y = pose6d.y
+        pose.position.z = pose6d.z
+        q = tf_conversions.transformations.quaternion_from_euler(pose6d.wx, pose6d.wy, pose6d.wz)
         pose.orientation.x = q[0]
         pose.orientation.y = q[1]
         pose.orientation.z = q[2]
@@ -297,7 +306,17 @@ class LocalPathGenerator(object):
 
     # 外れ値フィルタ
     def _filter(self, data):
-        pass
+        data_xy = {"x": data[0], "y":data[1]}
+        self._buffer.append(data_xy)
+        sum_x = sum_y = 0
+        for index in range(len(self._buffer)):
+            sum_x = sum_x + self._buffer[index]["x"]
+            sum_y = sum_y + self._buffer[index]["y"]
+        filter_x = sum_x / len(self._buffer)
+        filter_y = sum_y / len(self._buffer)
+        if len(self._buffer) == MAX_LENGTH:
+            self._buffer.pop(-1)
+        return filter_x, filter_y
 
     def _get_human_perception(self):
         human_around = self.perception.humansAroundPrivate.value()
@@ -323,7 +342,12 @@ class LocalPathGenerator(object):
             people_position_tf = almath.pose2DFromTransform(people_tf)
             # robot->world, world->people ==>> robot->people
             people_position = self.motion2robot.inverse() * people_position_tf
-            people_list.append(list(people_position.toVector()))
+
+            t_motion2robot = almath.transformFromPose2D(self.motion2robot)
+            t_world2people = almath.transformFromPosition6D(almath.position6DFromTransform(people_tf))
+            t_people_position = t_motion2robot.inverse() * t_world2people
+
+            people_list.append(list(almath.position6DFromTransform(t_people_position).toVector()))
             world2people.append(list(people_position_tf.toVector()))
         return people_list, world2people
 
@@ -365,14 +389,14 @@ class LocalPathGenerator(object):
         diff_angle = math.atan2(y, x)
         if 0.3 < diff_angle:
             self.x = self.y = 0.0
-            self.theta = 0.5
+            self.theta = 0.6
         elif diff_angle < -0.3:
             self.x = self.y = 0.0
-            self.theta = -0.5
+            self.theta = -0.6
         else:
             self.theta = 0.0
             if 0.5 < math.fabs(x):
-                self.x = 0.15
+                self.x = 0.2
             elif math.fabs(x) <= 0.5:
                 self.x = -0.15
             elif 0.5 < math.fbas(x) < 0.6:
@@ -380,34 +404,62 @@ class LocalPathGenerator(object):
             else:
                 self.x = 0.0
             if 0.2 < y:
-                self.y = 0.1
+                self.y = 0.1    
             elif y < -0.2:
                 self.y = -0.1
             else:
                 self.y = 0.0
 
-        print self.x, self.y, self.theta
+    def _head_control(self, data):
+        try:
+            head_pitch_z = almath.position6DFromTransform(almath.Transform(self.motion.getTransform("HeadPitch", 2, 0))).z
+            self._head_pitch = math.atan2(head_pitch_z - data[2], data[0])
+            self._head_yaw = math.atan2(data[1], data[0])
+            print self._head_pitch
+        except Exception as error:
+            self._failure(error)
+
+    # 位置制御ベース
+    def _position_control(self, x, y, theta):
+        self.x = x
+        self.y = y
+
+    def _failure(self, e):
+        exc_type, exc_obj, tb = sys.exc_info()
+        lineno = tb.tb_lineno
+        print(str(lineno)+":"+str(type(e)))
 
     def _main_thread(self):
         try:
             self.motion.move(self.x, self.y, self.theta)
+            self.motion.angleInterpolationWithSpeed(["HeadPitch", "HeadYaw"], [self._head_pitch, self._head_yaw], 1)
+            #if self.x != self.pre_x or self.y != self.pre_y or self.theta != self.pre_theta:
+            #if self.vel_flag and not self.pos_flag:
+                #;self.motion.move(0, 0, self.theta)
+            #elif not self.vel_flag and self.pos_flag:
+            #    self.motion.moveTo(self.x, self.y, 0)
         except Exception as e:
             self._failure(e)
 
     def run(self):
+        self.motion.stiffnessInterpolation(["HeadPitch", "HeadYaw"], [0.0, 0.0], 1.0)
         while not rospy.is_shutdown():
             people_list, world2people = self._get_human_perception()
-            #self._publish_tf(self._pose2d_to_geometry(list(self.motion2robot.inverse().toVector())), "robot_pose", "robot_pose")
+            self._publish_tf(self._pose2d_to_geometry(list(almath.position6DFromPose2D(self.motion2robot.inverse()).toVector())), "map", "robot_pose")
             if people_list != []:
+                #filter_x, filter_y = self._filter(people_list[0])
+                #print "people pose:", filter_x, filter_y, people_list[0][2]
                 self._publish_tf(self._pose2d_to_geometry(people_list[0]), "robot_pose", "people")
                 self._publish_marker(self._pose2d_to_geometry(people_list[0]))
-                self._generate_local_path(people_list)
-                print "people pose:", people_list[0][0], people_list[0][1], people_list[0][2]
+                #self._publish_marker(self._pose2d_to_geometry([filter_x, filter_y, people_list[0][2]]))
+                #self._generate_local_path(people_list)
                 # ワールド座標系における目標位置を設定する(ここではワールド座標系における一番近い人)
                 #self._steering_control.move(world2people[0][0], world2people[0][1], world2people[0][2])
                 # 速度制御実行
                 #self._steering_control._main_thread()
-                self._velocity_control(people_list[0][0], people_list[0][1], people_list[0][2])
+                self._velocity_control(people_list[0][0], people_list[0][1], people_list[0][5])
+                self._head_control(people_list[0])
+                #self._position_control(people_list[0][0], people_list[0][1], people_list[0][2])
             self.rate.sleep()
 
 if __name__ == '__main__':
